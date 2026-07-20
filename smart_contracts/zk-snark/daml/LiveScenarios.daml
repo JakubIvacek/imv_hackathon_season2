@@ -1,0 +1,219 @@
+module LiveScenarios where
+
+import Daml.Script
+import DA.List (head)
+import MediaVoting
+
+-- | Helper: look up an already-allocated demo party by its Navigator/Ledger
+-- display name (set by Setup.daml's `allocateParty "Voter"` etc). Does NOT
+-- allocate a new party -- reuses the existing one so we stay on the same
+-- contracts Setup.daml created.
+findParty : Text -> Script Party
+findParty name = do
+  known <- listKnownParties
+  case [ d.party | d <- known, d.displayName == Some name ] of
+    (p :: _) -> pure p
+    [] -> error ("No allocated party with displayName " <> name)
+
+-- | Debug helper: dump known parties and ZKProofSubmissions visible to the
+-- Verifier, to diagnose lookups.
+debugState : Script ()
+debugState = do
+  known <- listKnownParties
+  debug ("known parties: " <> show [ (d.party, d.displayName) | d <- known ])
+  verifier <- findParty "Verifier"
+  subs <- query @ZKProofSubmission verifier
+  debug ("ZKProofSubmission visible to verifier: " <> show subs)
+  pure ()
+
+-- ---------------------------------------------------------------------------
+-- Item 2: Verifier attests the starter (valid) proof -> ZKVoteAttestation +
+-- ZKNullifier are produced.
+-- ---------------------------------------------------------------------------
+attestValidProof : Script ()
+attestValidProof = do
+  voter <- findParty "Voter"
+  verifier <- findParty "Verifier"
+  reporterAgency <- findParty "ReporterAgency"
+
+  subs <- query @ZKProofSubmission verifier
+  let starter = head [ cid | (cid, s) <- subs, s.voterHash == "demo-voter-hash-001" ]
+
+  attCid <- submit verifier do
+    exerciseCmd starter AttestProof with
+      proofVerified = True
+      isLocalVoter = True
+
+  -- Evidence: the attestation exists with the expected outcome fields, and a
+  -- matching nullifier now exists for this (verifier, agency, event, media,
+  -- voterHash) key.
+  atts <- query @ZKVoteAttestation verifier
+  debug ("attestValidProof: ZKVoteAttestation count for verifier = " <> show (length atts))
+  nulls <- query @ZKNullifier verifier
+  debug ("attestValidProof: ZKNullifier count for verifier = " <> show (length nulls))
+
+  -- Sanity: the newly created attestation cid is present with the correct fields.
+  Some att <- queryContractId verifier attCid
+  debug ("attestValidProof: attestation = " <> show att)
+  assertMsg "attestation support should be True (from publicSignals.vote)" att.support
+  assertMsg "attestation isLocalVoter should be True" att.isLocalVoter
+  assertMsg "attestation voterHash should be demo-voter-hash-001" (att.voterHash == "demo-voter-hash-001")
+
+  pure ()
+
+-- ---------------------------------------------------------------------------
+-- Item 3: ReporterAgency tallies the attestation without ever seeing proof
+-- bytes; MediaItem's yesCount/localYesCount increment.
+-- ---------------------------------------------------------------------------
+tallyValidAttestation : Script ()
+tallyValidAttestation = do
+  voter <- findParty "Voter"
+  verifier <- findParty "Verifier"
+  reporterAgency <- findParty "ReporterAgency"
+
+  -- Confirm the privacy claim FIRST: reporterAgency's ledger view of
+  -- ZKProofSubmission must be empty -- proof bytes never reach it.
+  subsAtAgency <- query @ZKProofSubmission reporterAgency
+  debug ("tallyValidAttestation: ZKProofSubmission visible to ReporterAgency = " <> show (length subsAtAgency))
+  assertMsg "ReporterAgency must never see any ZKProofSubmission" (null subsAtAgency)
+
+  -- Find the attestation created in attestValidProof (support=True, media 1).
+  atts <- query @ZKVoteAttestation reporterAgency
+  let (attCid, att) = head [ (cid, a) | (cid, a) <- atts, a.voterHash == "demo-voter-hash-001" ]
+  debug ("tallyValidAttestation: attestation visible to ReporterAgency = " <> show att)
+
+  mediaBefore <- queryFilter @MediaItem reporterAgency
+                   (\m -> m.eventId == 1 && m.mediaId == 1)
+  let (mediaCidBefore, mediaBeforeVal) = head mediaBefore
+  debug ("tallyValidAttestation: MediaItem BEFORE tally = " <> show mediaBeforeVal)
+
+  newMediaCid <- submit reporterAgency do
+    exerciseCmd mediaCidBefore TallyMediaVote with attestationCid = attCid
+
+  Some mediaAfter <- queryContractId reporterAgency newMediaCid
+  debug ("tallyValidAttestation: MediaItem AFTER tally = " <> show mediaAfter)
+
+  assertMsg "yesCount should have incremented by 1"
+    (mediaAfter.yesCount == mediaBeforeVal.yesCount + 1)
+  assertMsg "localYesCount should have incremented by 1"
+    (mediaAfter.localYesCount == mediaBeforeVal.localYesCount + 1)
+
+  -- The attestation is consumed by RedeemForTally inside TallyMediaVote --
+  -- confirm it's gone from the agency's active contracts.
+  attsAfter <- query @ZKVoteAttestation reporterAgency
+  debug ("tallyValidAttestation: ZKVoteAttestation count AFTER tally = " <> show (length attsAfter))
+
+  -- Re-confirm the privacy claim held throughout: still zero submissions
+  -- visible to the agency after tallying.
+  subsAfter <- query @ZKProofSubmission reporterAgency
+  assertMsg "ReporterAgency must still never see any ZKProofSubmission after tallying" (null subsAfter)
+
+  pure ()
+
+-- ---------------------------------------------------------------------------
+-- Item 4: A mocked INVALID proof (proofVerified = False) on a brand-new
+-- submission produces no ZKVoteAttestation / tally update.
+-- ---------------------------------------------------------------------------
+attestInvalidProofRejected : Script ()
+attestInvalidProofRejected = do
+  voter <- findParty "Voter"
+  verifier <- findParty "Verifier"
+  reporterAgency <- findParty "ReporterAgency"
+
+  attsBefore <- query @ZKVoteAttestation reporterAgency
+  let countBefore = length attsBefore
+
+  subCid <- submit voter do
+    createCmd ZKProofSubmission with
+      voter
+      verifier
+      reporterAgency
+      eventId = 1
+      mediaId = Some 1
+      voterHash = "invalid-proof-voter-hash-001"
+      proofBytes = "demo-opaque-groth16-proof-bytes-INVALID"
+      publicSignals = PublicSignals with
+        pkAuth = "demo-authority-pubkey"
+        subject = "0xdemoVoterAddressInvalid"
+        vote = True
+        reqCity = "Riverside"
+        reqDistrict = "North"
+        hVC = "demo-hvc-commitment-invalid"
+
+  -- The verifier reports the off-ledger snarkjs check as FALSE. AttestProof's
+  -- assertMsg on `proofVerified` must abort the whole transaction: no
+  -- ZKVoteAttestation, no ZKNullifier.
+  submitMustFail verifier do
+    exerciseCmd subCid AttestProof with
+      proofVerified = False
+      isLocalVoter = False
+
+  attsAfter <- query @ZKVoteAttestation reporterAgency
+  debug ("attestInvalidProofRejected: ZKVoteAttestation count before = " <> show countBefore
+         <> ", after failed attest = " <> show (length attsAfter))
+  assertMsg "no new ZKVoteAttestation should have been created" (length attsAfter == countBefore)
+
+  nulls <- queryFilter @ZKNullifier verifier (\n -> n.voterHash == "invalid-proof-voter-hash-001")
+  debug ("attestInvalidProofRejected: ZKNullifier count for this voterHash = " <> show (length nulls))
+  assertMsg "no ZKNullifier should exist for the rejected voterHash" (null nulls)
+
+  -- The submission itself is still sitting there, un-consumed (AttestProof
+  -- never committed).
+  stillThere <- queryFilter @ZKProofSubmission verifier (\s -> s.voterHash == "invalid-proof-voter-hash-001")
+  assertMsg "the un-attested submission should still be active" (length stillThere == 1)
+
+  pure ()
+
+-- ---------------------------------------------------------------------------
+-- Item 5: Duplicate voterHash on the same target (eventId, mediaId) is
+-- rejected via the ZKNullifier key collision.
+-- ---------------------------------------------------------------------------
+duplicateVoterHashRejected : Script ()
+duplicateVoterHashRejected = do
+  voter <- findParty "Voter"
+  verifier <- findParty "Verifier"
+  reporterAgency <- findParty "ReporterAgency"
+
+  -- demo-voter-hash-001 was already attested (and its nullifier persisted)
+  -- in attestValidProof, on (eventId=1, mediaId=Some 1). Create a SECOND,
+  -- distinct ZKProofSubmission reusing that same voterHash + target.
+  dupSubCid <- submit voter do
+    createCmd ZKProofSubmission with
+      voter
+      verifier
+      reporterAgency
+      eventId = 1
+      mediaId = Some 1
+      voterHash = "demo-voter-hash-001"   -- SAME hash, SAME target -- reused
+      proofBytes = "demo-opaque-groth16-proof-bytes-DUPLICATE-ATTEMPT"
+      publicSignals = PublicSignals with
+        pkAuth = "demo-authority-pubkey"
+        subject = "0xdemoVoterAddress"
+        vote = True
+        reqCity = "Riverside"
+        reqDistrict = "North"
+        hVC = "demo-hvc-commitment"
+
+  nullsBefore <- queryFilter @ZKNullifier verifier (\n -> n.voterHash == "demo-voter-hash-001")
+  debug ("duplicateVoterHashRejected: existing ZKNullifier count for demo-voter-hash-001 before retry = "
+         <> show (length nullsBefore))
+  assertMsg "expected exactly one existing nullifier from attestValidProof" (length nullsBefore == 1)
+
+  -- Attesting this duplicate (even with a perfectly valid proofVerified=True)
+  -- must fail: `create ZKNullifier` collides on the
+  -- (verifier, reporterAgency, eventId, mediaId, voterHash) key.
+  submitMustFail verifier do
+    exerciseCmd dupSubCid AttestProof with
+      proofVerified = True
+      isLocalVoter = True
+
+  nullsAfter <- queryFilter @ZKNullifier verifier (\n -> n.voterHash == "demo-voter-hash-001")
+  debug ("duplicateVoterHashRejected: ZKNullifier count for demo-voter-hash-001 after rejected retry = "
+         <> show (length nullsAfter))
+  assertMsg "nullifier count must be unchanged (still exactly 1)" (length nullsAfter == 1)
+
+  attsForHash <- queryFilter @ZKVoteAttestation reporterAgency (\a -> a.voterHash == "demo-voter-hash-001")
+  debug ("duplicateVoterHashRejected: ZKVoteAttestation count for demo-voter-hash-001 after rejected retry = "
+         <> show (length attsForHash))
+
+  pure ()

@@ -2,5 +2,9 @@
 .daml/
 *.dar
 
+# daml start / Canton sandbox + Navigator runtime logs (per-variant)
+log/
+navigator.log
+
 # Editor/OS cruft
 .DS_Store

@@ -1,0 +1,192 @@
+-- | Live-ledger verification scripts for TEST_PLAN.md section 1 (no-zk).
+--
+-- These run against the already-booted sandbox (started via `daml start` on
+-- ports 6865/6866/6867/6868/7500/7575) and its already-allocated demo
+-- parties + starter NewsEvent/MediaItem (created by Setup.daml), rather than
+-- an ephemeral in-memory ledger. Each function corresponds to one remaining
+-- checklist item in TEST_PLAN.md section 1.
+--
+-- Run with:
+--   daml script --dar .daml/dist/media-voting-no-zk-0.1.0.dar \
+--     --script-name LiveScenarios:<name> --ledger-host localhost --ledger-port 6865
+
+module LiveScenarios where
+
+import Daml.Script
+import DA.Assert ((===))
+import DA.List (find)
+import MediaVoting
+
+-- Look up an already-allocated demo party by its display name (does NOT
+-- allocate a new party -- continuity with Setup.daml's contracts depends on
+-- reusing the same party identities).
+findParty : Text -> Script Party
+findParty name = do
+  parties <- listKnownParties
+  let matchp p = p.displayName == Some name
+  case find matchp parties of
+    Some p -> pure p.party
+    None -> error ("No allocated party with displayName " <> name)
+
+-- Fetch the starter MediaItem (reporter, eventId=1, mediaId=1) as seen by
+-- the given reader.
+getStarterMedia : Party -> Party -> Script (ContractId MediaItem, MediaItem)
+getStarterMedia reader reporter = do
+  cs <- query @MediaItem reader
+  case find (\(_, m) -> m.reporter == reporter && m.eventId == 1 && m.mediaId == 1) cs of
+    Some c -> pure c
+    None -> error "starter MediaItem not found"
+
+getStarterEvent : Party -> Party -> Script (ContractId NewsEvent, NewsEvent)
+getStarterEvent reader reporter = do
+  cs <- query @NewsEvent reader
+  case find (\(_, e) -> e.reporter == reporter && e.eventId == 1) cs of
+    Some c -> pure c
+    None -> error "starter NewsEvent not found"
+
+-- Item 2: Alice votes yes/local on the starter MediaItem; tallies increment.
+aliceVotesOnMedia : Script ()
+aliceVotesOnMedia = script do
+  reporter <- findParty "Reporter"
+  alice <- findParty "Alice"
+
+  (mediaCid0, m0) <- getStarterMedia alice reporter
+  debug ("before: yesCount=" <> show m0.yesCount <> " localYesCount=" <> show m0.localYesCount)
+
+  mediaCid1 <- submit alice do
+    exerciseCmd mediaCid0 VoteOnMedia with
+      voter = alice
+      voterHash = "alice-vote-1"
+      support = True
+      isLocalVoter = True
+
+  Some m1 <- queryContractId alice mediaCid1
+  debug ("after: yesCount=" <> show m1.yesCount <> " localYesCount=" <> show m1.localYesCount)
+  m1.yesCount === m0.yesCount + 1
+  m1.localYesCount === m0.localYesCount + 1
+  m1.noCount === m0.noCount
+  m1.localNoCount === m0.localNoCount
+
+  debug "PASS: aliceVotesOnMedia"
+
+-- Item 3: Alice retries the exact same VoteOnMedia call (same voterHash).
+-- Must be rejected (MediaVote key collision).
+aliceDuplicateVoteRejected : Script ()
+aliceDuplicateVoteRejected = script do
+  reporter <- findParty "Reporter"
+  alice <- findParty "Alice"
+
+  (mediaCid0, _) <- getStarterMedia alice reporter
+
+  submitMustFail alice do
+    exerciseCmd mediaCid0 VoteOnMedia with
+      voter = alice
+      voterHash = "alice-vote-1"
+      support = True
+      isLocalVoter = True
+
+  debug "PASS: aliceDuplicateVoteRejected (duplicate voterHash correctly rejected)"
+
+-- Item 4: Bob votes with a different hash; tallies increment again.
+bobVotesOnMedia : Script ()
+bobVotesOnMedia = script do
+  reporter <- findParty "Reporter"
+  bob <- findParty "Bob"
+
+  (mediaCid0, m0) <- getStarterMedia bob reporter
+  debug ("before: yesCount=" <> show m0.yesCount <> " noCount=" <> show m0.noCount)
+
+  mediaCid1 <- submit bob do
+    exerciseCmd mediaCid0 VoteOnMedia with
+      voter = bob
+      voterHash = "bob-vote-1"
+      support = False
+      isLocalVoter = False
+
+  Some m1 <- queryContractId bob mediaCid1
+  debug ("after: yesCount=" <> show m1.yesCount <> " noCount=" <> show m1.noCount)
+  m1.noCount === m0.noCount + 1
+  m1.yesCount === m0.yesCount
+  m1.localNoCount === m0.localNoCount
+  m1.localYesCount === m0.localYesCount
+
+  debug "PASS: bobVotesOnMedia"
+
+-- Item 5: VoteOnEvent on the NewsEvent itself; tallies update independently
+-- of the MediaItem's.
+voteOnEventIndependentTally : Script ()
+voteOnEventIndependentTally = script do
+  reporter <- findParty "Reporter"
+  alice <- findParty "Alice"
+  bob <- findParty "Bob"
+
+  (eventCid0, e0) <- getStarterEvent alice reporter
+  (_, mBefore) <- getStarterMedia alice reporter
+  debug ("event before: yesCount=" <> show e0.yesCount <> " localYesCount=" <> show e0.localYesCount)
+
+  eventCid1 <- submit alice do
+    exerciseCmd eventCid0 VoteOnEvent with
+      voter = alice
+      voterHash = "alice-event-vote-1"
+      support = True
+      isLocalVoter = True
+
+  eventCid2 <- submit bob do
+    exerciseCmd eventCid1 VoteOnEvent with
+      voter = bob
+      voterHash = "bob-event-vote-1"
+      support = False
+      isLocalVoter = False
+
+  Some e2 <- queryContractId alice eventCid2
+  debug ("event after: yesCount=" <> show e2.yesCount <> " noCount=" <> show e2.noCount
+         <> " localYesCount=" <> show e2.localYesCount <> " localNoCount=" <> show e2.localNoCount)
+
+  e2.yesCount === e0.yesCount + 1
+  e2.noCount === e0.noCount + 1
+  e2.localYesCount === e0.localYesCount + 1
+  e2.localNoCount === e0.localNoCount
+
+  -- Confirm the MediaItem's own tallies were untouched by the event votes.
+  (_, mAfter) <- getStarterMedia alice reporter
+  debug ("media unaffected: yesCount=" <> show mAfter.yesCount <> " noCount=" <> show mAfter.noCount)
+  mAfter.yesCount === mBefore.yesCount
+  mAfter.noCount === mBefore.noCount
+  mAfter.localYesCount === mBefore.localYesCount
+  mAfter.localNoCount === mBefore.localNoCount
+
+  debug "PASS: voteOnEventIndependentTally"
+
+-- Item 6: "No privacy" check -- any logged-in party (here: Bob, who is
+-- merely a community observer, not the reporter or the voter) can read the
+-- full contents of a vote cast by someone else (voter Party, voterHash,
+-- support), confirming there is no confidentiality on vote contracts.
+bobSeesAliceVoteContents : Script ()
+bobSeesAliceVoteContents = script do
+  reporter <- findParty "Reporter"
+  alice <- findParty "Alice"
+  bob <- findParty "Bob"
+
+  -- Bob queries MediaVote contracts as himself -- he is only a `community`
+  -- observer on these votes, not their signatory nor their voter.
+  votes <- query @MediaVote bob
+  case find (\(_, v) -> v.voter == alice && v.voterHash == "alice-vote-1") votes of
+    Some (_, v) -> do
+      debug ("Bob sees Alice's vote: voter=" <> show v.voter <> " voterHash=" <> v.voterHash
+             <> " support=" <> show v.support <> " isLocalVoter=" <> show v.isLocalVoter)
+      v.voter === alice
+      v.voterHash === "alice-vote-1"
+      v.support === True
+      v.isLocalVoter === True
+      debug "PASS: bobSeesAliceVoteContents (no-privacy property confirmed)"
+    None -> error "FAIL: Bob could not see Alice's MediaVote contract at all"
+
+  -- Same check for the event-level vote Alice cast in item 5.
+  eventVotes <- query @EventVote bob
+  case find (\(_, v) -> v.voter == alice && v.voterHash == "alice-event-vote-1") eventVotes of
+    Some (_, v) -> do
+      debug ("Bob sees Alice's EventVote: voter=" <> show v.voter <> " voterHash=" <> v.voterHash
+             <> " support=" <> show v.support)
+      v.voter === alice
+      debug "PASS: bobSeesAliceVoteContents EventVote (no-privacy property confirmed)"
+    None -> error "FAIL: Bob could not see Alice's EventVote contract"

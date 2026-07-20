@@ -1,0 +1,226 @@
+-- | Live-ledger verification scripts for the canton-privacy manual test plan
+-- (TEST_PLAN.md section 2, items 2-6). These run with `daml script` against
+-- an already-running sandbox (booted via `daml start`, parties + starter
+-- data already created by Setup.daml) rather than an ephemeral test ledger.
+--
+-- Each function below looks up the already-allocated demo parties by their
+-- displayName and queries for the already-existing starter contracts by
+-- their known field values, instead of allocating new parties or hardcoding
+-- contract IDs.
+
+module LiveScenarios where
+
+import Daml.Script
+import DA.Assert ((===))
+import DA.List (head)
+import MediaVoting
+
+-- | Look up an already-allocated party by its Navigator/ledger displayName
+-- (set by allocateParty in Setup.daml). Fails loudly if not found, so a
+-- typo'd name doesn't silently allocate-adjacent behavior.
+findParty : Text -> Script Party
+findParty name = do
+  known <- listKnownParties
+  case filter (\pd -> pd.displayName == Some name) known of
+    (pd :: _) -> pure pd.party
+    [] -> error ("party not found: " <> name)
+
+data Parties = Parties
+  with
+    issuer : Party
+    voter : Party
+    verifier : Party
+    reporterAgency : Party
+
+lookupParties : Script Parties
+lookupParties = do
+  issuer <- findParty "Issuer"
+  voter <- findParty "Voter"
+  verifier <- findParty "Verifier"
+  reporterAgency <- findParty "ReporterAgency"
+  pure Parties with ..
+
+-- | Debug helper: dump known parties and what each can see.
+debugState : Script ()
+debugState = script do
+  known <- listKnownParties
+  debug known
+  Parties{..} <- lookupParties
+  vAll <- query @VerifiableCredential verifier
+  debug ("verifier VCs: " <> show (length vAll))
+  rAll <- query @VerifiableCredential reporterAgency
+  debug ("agency VCs: " <> show (length rAll))
+  evs <- query @NewsEvent reporterAgency
+  debug ("agency NewsEvents: " <> show (length evs))
+  mis <- query @MediaItem reporterAgency
+  debug ("agency MediaItems: " <> show (length mis))
+
+-- | Item 2: Verifier sees the starter VC and exercises VerifyAndAttest with
+-- matching reqCity/reqDistrict -> isLocalVoter = True, votingParty = Voter.
+-- Confirms a VoteAttestation + VoteNullifier are produced.
+item2_verifyAndAttest : Script ()
+item2_verifyAndAttest = script do
+  Parties{..} <- lookupParties
+
+  -- Verifier CAN see the starter VC.
+  verifierVCs <- query @VerifiableCredential verifier
+  length verifierVCs === 1
+  let (vcCid, vc) = head verifierVCs
+  vc.city === "Riverside"
+  vc.district === "North"
+  vc.voterHash === "demo-voter-hash-001"
+
+  attCid <- submit verifier do
+    exerciseCmd vcCid VerifyAndAttest with
+      reporterAgency
+      eventId = 1
+      mediaId = None
+      reqCity = "Riverside"
+      reqDistrict = "North"
+      votingParty = voter
+      support = True
+
+  Some att <- queryContractId verifier attCid
+  att.support === True
+  att.isLocalVoter === True
+  att.voterHash === "demo-voter-hash-001"
+
+  -- The nullifier now exists for this (verifier, agency, event, media, hash).
+  nullifiers <- query @VoteNullifier verifier
+  length nullifiers === 1
+  let (_, nf) = head nullifiers
+  nf.voterHash === "demo-voter-hash-001"
+
+  debug "item2: VerifyAndAttest OK -- VoteAttestation.isLocalVoter=True, VoteNullifier created"
+
+-- | Item 3: ReporterAgency tallies the attestation from item 2 without ever
+-- seeing VC fields; NewsEvent tallies increment.
+item3_tallyWithoutVC : Script ()
+item3_tallyWithoutVC = script do
+  Parties{..} <- lookupParties
+
+  -- Privacy check: ReporterAgency's view of VerifiableCredential is empty.
+  agencyVCs <- query @VerifiableCredential reporterAgency
+  agencyVCs === []
+
+  -- The attestation IS visible to the agency, with only support/isLocalVoter/voterHash.
+  agencyAtts <- query @VoteAttestation reporterAgency
+  length agencyAtts === 1
+  let (attCid, att) = head agencyAtts
+  att.support === True
+  att.isLocalVoter === True
+  att.voterHash === "demo-voter-hash-001"
+
+  events <- query @NewsEvent reporterAgency
+  let (eventCid, ev) = head (filter (\(_, e) -> e.eventId == 1) events)
+  ev.yesCount === 0
+
+  eventCid1 <- submit reporterAgency do
+    exerciseCmd eventCid TallyEventVote with attestationCid = attCid
+
+  Some e1 <- queryContractId reporterAgency eventCid1
+  e1.yesCount === 1
+  e1.noCount === 0
+  e1.localYesCount === 1
+  e1.localNoCount === 0
+
+  -- Re-confirm privacy holds after tallying too.
+  agencyVCsAfter <- query @VerifiableCredential reporterAgency
+  agencyVCsAfter === []
+
+  debug "item3: agency VC query empty both before/after; NewsEvent yesCount=1, localYesCount=1 after TallyEventVote"
+
+-- | Item 4: a second VerifyAndAttest with the SAME voterHash on the SAME
+-- target (eventId=1, mediaId=None) is rejected (VoteNullifier key collision).
+-- Requires item2 to have run first (same sandbox instance) so the nullifier
+-- already exists.
+item4_doubleAttestRejected : Script ()
+item4_doubleAttestRejected = script do
+  Parties{..} <- lookupParties
+
+  verifierVCs <- query @VerifiableCredential verifier
+  let (vcCid, _) = head verifierVCs
+
+  submitMustFail verifier do
+    exerciseCmd vcCid VerifyAndAttest with
+      reporterAgency
+      eventId = 1
+      mediaId = None
+      reqCity = "Riverside"
+      reqDistrict = "North"
+      votingParty = voter
+      support = False
+
+  debug "item4: second VerifyAndAttest with voterHash=demo-voter-hash-001 on (eventId=1, mediaId=None) rejected as expected (VoteNullifier key collision)"
+
+-- | Item 5: votingParty set to a party other than the VC's actual voter is
+-- rejected by the pkEq assert. Uses a fresh target (mediaId = Some 1) so it
+-- doesn't collide with the nullifier from item 2/4.
+item5_wrongVotingPartyRejected : Script ()
+item5_wrongVotingPartyRejected = script do
+  Parties{..} <- lookupParties
+
+  verifierVCs <- query @VerifiableCredential verifier
+  let (vcCid, _) = head verifierVCs
+
+  -- issuer is definitely not the VC's voter -- use it as the wrong votingParty.
+  submitMustFail verifier do
+    exerciseCmd vcCid VerifyAndAttest with
+      reporterAgency
+      eventId = 1
+      mediaId = Some 1
+      reqCity = "Riverside"
+      reqDistrict = "North"
+      votingParty = issuer
+      support = True
+
+  debug "item5: VerifyAndAttest with votingParty=Issuer (not the VC's voter) rejected as expected (pkEq assert)"
+
+-- | Item 6: a VC whose city/district don't match the event's required
+-- values still succeeds, but with isLocalVoter = False (soft flag). Creates
+-- a SECOND VerifiableCredential (does not mutate the starter one) with a
+-- non-matching city/district and a fresh voterHash.
+item6_cityMismatchSoftFlag : Script ()
+item6_cityMismatchSoftFlag = script do
+  Parties{..} <- lookupParties
+
+  vcMismatchCid <- submitMulti [issuer, voter] [verifier] do
+    createCmd VerifiableCredential with
+      issuer
+      voter
+      verifier
+      subjectAddress = "0xdemoVoterAddress"
+      city = "Lakeside"        -- mismatch vs event's required "Riverside"
+      district = "South"       -- mismatch vs event's required "North"
+      metadata = "demo-vc-metadata-mismatch"
+      voterHash = "demo-voter-hash-002-mismatch"
+
+  attCid <- submit verifier do
+    exerciseCmd vcMismatchCid VerifyAndAttest with
+      reporterAgency
+      eventId = 1
+      mediaId = Some 1
+      reqCity = "Riverside"
+      reqDistrict = "North"
+      votingParty = voter
+      support = True
+
+  Some att <- queryContractId verifier attCid
+  att.support === True
+  att.isLocalVoter === False    -- soft flag, not a rejection
+  att.voterHash === "demo-voter-hash-002-mismatch"
+
+  -- Tally it to show the vote still counts globally but not locally.
+  mediaItems <- query @MediaItem reporterAgency
+  let (mediaCid, mi) = head (filter (\(_, m) -> m.eventId == 1 && m.mediaId == 1) mediaItems)
+  yesCountBefore <- pure mi.yesCount
+  localYesBefore <- pure mi.localYesCount
+
+  mediaCid1 <- submit reporterAgency do
+    exerciseCmd mediaCid TallyMediaVote with attestationCid = attCid
+
+  Some m1 <- queryContractId reporterAgency mediaCid1
+  m1.yesCount === yesCountBefore + 1
+  m1.localYesCount === localYesBefore   -- unchanged: not local
+
+  debug "item6: mismatched VC (city=Lakeside/district=South vs required Riverside/North) -> isLocalVoter=False (soft flag, attestation still created); MediaItem yesCount incremented, localYesCount unchanged"
