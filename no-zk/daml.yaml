@@ -1,0 +1,11 @@
+sdk-version: 2.10.4
+name: media-voting-no-zk
+source: daml
+version: 0.1.0
+sandbox-options:
+  - --wall-clock-time
+parties: []
+dependencies:
+  - daml-prim
+  - daml-stdlib
+  - daml-script

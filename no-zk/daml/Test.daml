@@ -1,0 +1,184 @@
+-- | Daml Script tests for the NO-ZK baseline media-voting variant.
+--
+-- Covers:
+--   (a) happy path: create event -> add media -> vote yes/no on media and on
+--       the event, asserting the tallies (yes/no/local) update exactly like the
+--       Solidity contract.
+--   (b) double-vote rejection: a second vote carrying the same `voterHash` is
+--       rejected by the ledger because it would collide with an existing
+--       EventVote / MediaVote contract key (the Daml equivalent of the Solidity
+--       `require(!hasVoted[...])`).
+--
+-- Also demonstrates the query-style equivalents of the Solidity view functions
+-- `getEvent`, `getMediaItem`, `hasVotedOnEvent`, `hasVotedOnMedia`.
+
+module Test where
+
+import Daml.Script
+import DA.Assert ((===))
+import DA.Optional (isSome)
+import MediaVoting
+
+-- Query helpers: the Solidity `view` functions have no on-ledger choice in
+-- Daml; they are ledger queries. `getEvent` / `getMediaItem` are just
+-- `queryContractId`; `hasVotedOn*` are contract-key lookups.
+
+hasVotedOnEvent : Party -> Party -> Int -> Text -> Script Bool
+hasVotedOnEvent reader reporter eventId voterHash = do
+  r <- queryContractKey @EventVote reader (reporter, eventId, voterHash)
+  pure (isSome r)
+
+hasVotedOnMedia : Party -> Party -> Int -> Int -> Text -> Script Bool
+hasVotedOnMedia reader reporter eventId mediaId voterHash = do
+  r <- queryContractKey @MediaVote reader (reporter, eventId, mediaId, voterHash)
+  pure (isSome r)
+
+-- | Happy path with correct tally updates.
+happyPath : Script ()
+happyPath = script do
+  reporter <- allocateParty "Reporter"
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  let community = [alice, bob]
+
+  -- createEvent
+  eventCid <- submit reporter do
+    createCmd NewsEvent with
+      reporter
+      community
+      eventId = 0
+      name = "Flood in Riverside"
+      description = "Heavy flooding downtown"
+      location = "Riverside"
+      timestamp = 1700000000
+      reporterName = "Jane Doe"
+      reporterOrg = "IMV News"
+      yesCount = 0
+      noCount = 0
+      localYesCount = 0
+      localNoCount = 0
+
+  -- addMediaItem
+  mediaCid0 <- submit reporter do
+    exerciseCmd eventCid AddMediaItem with
+      mediaId = 0
+      uri = "ipfs://photo1"
+      description = "Street underwater"
+      mediaType = "image"
+
+  -- Alice votes YES and is a local voter -> yes +1, localYes +1.
+  mediaCid1 <- submit alice do
+    exerciseCmd mediaCid0 VoteOnMedia with
+      voter = alice
+      voterHash = "vc-hash-alice"
+      support = True
+      isLocalVoter = True
+
+  Some m1 <- queryContractId reporter mediaCid1
+  m1.yesCount === 1
+  m1.noCount === 0
+  m1.localYesCount === 1
+  m1.localNoCount === 0
+
+  -- Bob votes NO and is NOT local -> no +1, localNo stays 0.
+  mediaCid2 <- submit bob do
+    exerciseCmd mediaCid1 VoteOnMedia with
+      voter = bob
+      voterHash = "vc-hash-bob"
+      support = False
+      isLocalVoter = False
+
+  Some m2 <- queryContractId reporter mediaCid2
+  m2.yesCount === 1
+  m2.noCount === 1
+  m2.localYesCount === 1
+  m2.localNoCount === 0
+
+  -- Vote on the event as a whole: Alice YES + local.
+  eventCid1 <- submit alice do
+    exerciseCmd eventCid VoteOnEvent with
+      voter = alice
+      voterHash = "vc-hash-alice"
+      support = True
+      isLocalVoter = True
+
+  Some e1 <- queryContractId reporter eventCid1
+  e1.yesCount === 1
+  e1.noCount === 0
+  e1.localYesCount === 1
+  e1.localNoCount === 0
+
+  -- Query helpers (getMediaItem / hasVotedOn*).
+  votedAliceMedia <- hasVotedOnMedia reporter reporter 0 0 "vc-hash-alice"
+  votedAliceMedia === True
+  votedCarolMedia <- hasVotedOnMedia reporter reporter 0 0 "vc-hash-carol"
+  votedCarolMedia === False
+  votedAliceEvent <- hasVotedOnEvent reporter reporter 0 "vc-hash-alice"
+  votedAliceEvent === True
+
+  pure ()
+
+-- | A second vote with the SAME voterHash must be rejected by the ledger,
+-- on both the media path and the event path.
+doubleVoteRejected : Script ()
+doubleVoteRejected = script do
+  reporter <- allocateParty "Reporter"
+  alice <- allocateParty "Alice"
+  let community = [alice]
+
+  eventCid <- submit reporter do
+    createCmd NewsEvent with
+      reporter
+      community
+      eventId = 0
+      name = "Protest march"
+      description = "Downtown protest"
+      location = "Capital"
+      timestamp = 1700000000
+      reporterName = "John Roe"
+      reporterOrg = "IMV News"
+      yesCount = 0
+      noCount = 0
+      localYesCount = 0
+      localNoCount = 0
+
+  mediaCid0 <- submit reporter do
+    exerciseCmd eventCid AddMediaItem with
+      mediaId = 0
+      uri = "ipfs://clip1"
+      description = "Crowd footage"
+      mediaType = "video"
+
+  -- First media vote succeeds.
+  mediaCid1 <- submit alice do
+    exerciseCmd mediaCid0 VoteOnMedia with
+      voter = alice
+      voterHash = "dup-hash"
+      support = True
+      isLocalVoter = False
+
+  -- Second media vote with the SAME voterHash -> colliding MediaVote key ->
+  -- ledger rejects the whole transaction (tally is NOT changed).
+  submitMustFail alice do
+    exerciseCmd mediaCid1 VoteOnMedia with
+      voter = alice
+      voterHash = "dup-hash"
+      support = False
+      isLocalVoter = False
+
+  -- Same guarantee for the event path.
+  eventCid1 <- submit alice do
+    exerciseCmd eventCid VoteOnEvent with
+      voter = alice
+      voterHash = "dup-event-hash"
+      support = True
+      isLocalVoter = False
+
+  submitMustFail alice do
+    exerciseCmd eventCid1 VoteOnEvent with
+      voter = alice
+      voterHash = "dup-event-hash"
+      support = False
+      isLocalVoter = False
+
+  pure ()

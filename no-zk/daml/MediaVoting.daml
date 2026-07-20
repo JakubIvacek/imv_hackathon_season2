@@ -1,0 +1,207 @@
+-- | Media / news-event credibility voting -- NO-ZK BASELINE VARIANT.
+--
+-- ============================================================================
+--  PRIVACY WARNING: THIS VARIANT HAS **NO PRIVACY PROPERTIES WHATSOEVER**.
+-- ============================================================================
+--  This is the deliberate, naive baseline against which two later
+--  privacy-preserving variants (a ZK-SNARK variant and a Canton-native-privacy
+--  variant) will be compared. Here:
+--
+--    * Every individual vote is a full ledger contract (`EventVote` /
+--      `MediaVote`) whose content -- the voter's `Party`, their `voterHash`,
+--      how they voted (`support`) and whether they are a local voter -- is
+--      visible in cleartext to ALL stakeholders of that contract (the reporter
+--      plus the whole `community` observer list).
+--    * There is no cryptographic hiding, no unlinkability and no zero-knowledge
+--      proof of eligibility. The `voterHash` is used purely for de-duplication,
+--      exactly like the Solidity `mapping(bytes32 => bool) hasVoted`.
+--
+--  Do NOT use this variant where voter privacy matters. It exists only as the
+--  transparent contrast point for the privacy work.
+-- ============================================================================
+--
+-- Port of `media-voting-smart-contract/src/MediaVoting.sol` (the no-ZK path
+-- only; the ZK-SNARK `voteOnMediaWithProof` path is intentionally omitted).
+--
+-- Modeling notes (see README.md for the full mapping):
+--   * Solidity keeps a growing `NewsEvent[]` array with nested `MediaItem[]`
+--     arrays and per-item `mapping(bytes32 => bool)`. Daml has no mutable
+--     nested arrays, so:
+--       - `NewsEvent` and `MediaItem` are separate templates. A `MediaItem`
+--         links to its event by the stable natural key `(reporter, eventId)`
+--         rather than by ContractId (a ContractId changes every time the event
+--         is re-created to update its tallies).
+--       - Casting a vote updates a tally, which in Daml means archive + create
+--         a fresh contract with the incremented counters (contracts are
+--         immutable). The vote choices are therefore `consuming`.
+--   * The `hasVoted` / `hasVotedOnEvent` mappings become Daml **contract keys**
+--     on the `EventVote` / `MediaVote` templates. A second `create` with a
+--     colliding key is rejected by the ledger itself -- the idiomatic
+--     equivalent of `require(!hasVoted[...])`.
+
+module MediaVoting where
+
+-- A news event, signed by the reporter who filed it. The `community` list are
+-- the eligible voters; they are observers, so (baseline, no privacy) they see
+-- the event, its running tallies and -- via the vote contracts below -- every
+-- individual vote.
+template NewsEvent
+  with
+    reporter : Party            -- Solidity `reporter` (address -> Party)
+    community : [Party]          -- eligible voters / observers (no Solidity analogue; open in Solidity)
+    eventId : Int                -- Solidity `id` (index in the newsEvents array)
+    name : Text
+    description : Text
+    location : Text
+    timestamp : Int              -- Solidity `uint64 timestamp`
+    reporterName : Text
+    reporterOrg : Text
+    -- Event-level tallies (Solidity yesCount / noCount / localYesCount / localNoCount).
+    yesCount : Int
+    noCount : Int
+    localYesCount : Int
+    localNoCount : Int
+  where
+    signatory reporter
+    observer community
+
+    -- Stable identity used by MediaItems and votes to refer to this event.
+    key (reporter, eventId) : (Party, Int)
+    maintainer key._1
+
+    -- Solidity `addMediaItem`. Nonconsuming: adding media does not disturb the
+    -- event contract or its tallies.
+    nonconsuming choice AddMediaItem : ContractId MediaItem
+      with
+        mediaId : Int            -- Solidity `mediaId` (index in mediaItems array)
+        uri : Text
+        description : Text
+        mediaType : Text
+      controller reporter
+      do
+        create MediaItem with
+          reporter
+          community
+          eventId
+          mediaId
+          uri
+          description
+          mediaType
+          yesCount = 0
+          noCount = 0
+          localYesCount = 0
+          localNoCount = 0
+
+    -- Solidity `voteOnEvent`. Consuming so the tally can be updated (archive +
+    -- recreate). De-duplication is enforced by the `EventVote` contract key.
+    choice VoteOnEvent : ContractId NewsEvent
+      with
+        voter : Party
+        voterHash : Text         -- Solidity `bytes32 voterHash`, here Text
+        support : Bool
+        isLocalVoter : Bool
+      controller voter
+      do
+        -- Fails (aborting the whole transaction) if this (reporter, eventId,
+        -- voterHash) already voted -- the `require(!hasVotedOnEvent[...])`.
+        create EventVote with
+          reporter
+          community
+          voter
+          eventId
+          voterHash
+          support
+          isLocalVoter
+        -- Same increment logic as the Solidity contract.
+        create this with
+          yesCount      = if support then yesCount + 1 else yesCount
+          noCount       = if support then noCount else noCount + 1
+          localYesCount = if support && isLocalVoter then localYesCount + 1 else localYesCount
+          localNoCount  = if not support && isLocalVoter then localNoCount + 1 else localNoCount
+
+-- One media item belonging to a news event, signed by the reporter. Links to
+-- its event by the natural key `(reporter, eventId)`.
+template MediaItem
+  with
+    reporter : Party
+    community : [Party]
+    eventId : Int                -- which NewsEvent this belongs to
+    mediaId : Int                -- Solidity `id` (index in mediaItems array)
+    uri : Text
+    description : Text
+    mediaType : Text
+    yesCount : Int
+    noCount : Int
+    localYesCount : Int
+    localNoCount : Int
+  where
+    signatory reporter
+    observer community
+
+    key (reporter, eventId, mediaId) : (Party, Int, Int)
+    maintainer key._1
+
+    -- Solidity `voteOnMedia` (the no-ZK `_vote` path).
+    choice VoteOnMedia : ContractId MediaItem
+      with
+        voter : Party
+        voterHash : Text
+        support : Bool
+        isLocalVoter : Bool
+      controller voter
+      do
+        -- De-dup: `require(!m.hasVoted[voterHash])` via the MediaVote key.
+        create MediaVote with
+          reporter
+          community
+          voter
+          eventId
+          mediaId
+          voterHash
+          support
+          isLocalVoter
+        create this with
+          yesCount      = if support then yesCount + 1 else yesCount
+          noCount       = if support then noCount else noCount + 1
+          localYesCount = if support && isLocalVoter then localYesCount + 1 else localYesCount
+          localNoCount  = if not support && isLocalVoter then localNoCount + 1 else localNoCount
+
+-- A single event-level vote. The contract key replaces the Solidity
+-- `hasVotedOnEvent` mapping: the maintainer is the reporter, so the key
+-- namespace is shared across ALL voter identities -- two different Daml
+-- Parties presenting the same `voterHash` still collide and the second create
+-- is rejected. NO PRIVACY: reporter + community see voter, voterHash, support.
+template EventVote
+  with
+    reporter : Party
+    community : [Party]
+    voter : Party
+    eventId : Int
+    voterHash : Text
+    support : Bool
+    isLocalVoter : Bool
+  where
+    signatory reporter
+    observer voter, community
+
+    key (reporter, eventId, voterHash) : (Party, Int, Text)
+    maintainer key._1
+
+-- A single media-level vote. Contract key replaces the per-MediaItem
+-- `hasVoted` mapping. NO PRIVACY (see EventVote).
+template MediaVote
+  with
+    reporter : Party
+    community : [Party]
+    voter : Party
+    eventId : Int
+    mediaId : Int
+    voterHash : Text
+    support : Bool
+    isLocalVoter : Bool
+  where
+    signatory reporter
+    observer voter, community
+
+    key (reporter, eventId, mediaId, voterHash) : (Party, Int, Int, Text)
+    maintainer key._1
