@@ -1,0 +1,39 @@
+module Setup where
+
+import Daml.Script
+import MediaVoting
+
+-- | Allocates demo parties and creates one starter NewsEvent + MediaItem so
+-- Navigator has something to look at immediately. Run once against a live
+-- sandbox with: daml script --dar .daml/dist/media-voting-no-zk-0.1.0.dar
+-- --script-name Setup:init --ledger-host localhost --ledger-port 6865
+init : Script ()
+init = do
+  reporter <- allocateParty "Reporter"
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+
+  eventCid <- submit reporter do
+    createCmd NewsEvent with
+      reporter
+      community = [alice, bob]
+      eventId = 1
+      name = "Flooding in Riverside District"
+      description = "Heavy rainfall caused flash flooding near the river."
+      location = "Riverside"
+      timestamp = 1780000000
+      reporterName = "Jamie Rivera"
+      reporterOrg = "Local Wire News"
+      yesCount = 0
+      noCount = 0
+      localYesCount = 0
+      localNoCount = 0
+
+  _ <- submit reporter do
+    exerciseCmd eventCid AddMediaItem with
+      mediaId = 1
+      uri = "ipfs://demo-cid-flood-photo"
+      description = "Photo of the flooded main street"
+      mediaType = "image"
+
+  pure ()

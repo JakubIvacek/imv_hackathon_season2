@@ -1,0 +1,56 @@
+module Setup where
+
+import Daml.Script
+import MediaVoting
+
+-- | Allocates the demo parties and creates a starter NewsEvent + MediaItem
+-- (as reporter/agency) plus one ZKProofSubmission (voter, observed by
+-- verifier), so the AttestProof -> Tally pipeline can be exercised
+-- immediately in Navigator without first submitting a proof by hand. Runs
+-- automatically on `daml start` via `init-script: Setup:init` in daml.yaml.
+init : Script ()
+init = do
+  voter <- allocateParty "Voter"
+  verifier <- allocateParty "Verifier"
+  reporter <- allocateParty "ReporterAgency"
+
+  eventCid <- submit reporter do
+    createCmd NewsEvent with
+      reporter
+      eventId = 1
+      name = "Flooding in Riverside District"
+      description = "Heavy rainfall caused flash flooding near the river."
+      location = "Riverside"
+      timestamp = 1780000000
+      reporterName = "Jamie Rivera"
+      reporterOrg = "Local Wire News"
+      yesCount = 0
+      noCount = 0
+      localYesCount = 0
+      localNoCount = 0
+
+  _ <- submit reporter do
+    exerciseCmd eventCid AddMediaItem with
+      mediaId = 1
+      uri = "ipfs://demo-cid-flood-photo"
+      description = "Photo of the flooded main street"
+      mediaType = "image"
+
+  _ <- submit voter do
+    createCmd ZKProofSubmission with
+      voter
+      verifier
+      reporterAgency = reporter
+      eventId = 1
+      mediaId = Some 1
+      voterHash = "demo-voter-hash-001"
+      proofBytes = "demo-opaque-groth16-proof-bytes"
+      publicSignals = PublicSignals with
+        pkAuth = "demo-authority-pubkey"
+        subject = "0xdemoVoterAddress"
+        vote = True
+        reqCity = "Riverside"
+        reqDistrict = "North"
+        hVC = "demo-hvc-commitment"
+
+  pure ()
