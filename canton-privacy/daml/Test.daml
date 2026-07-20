@@ -1,0 +1,350 @@
+-- | Daml Script tests for the CANTON-NATIVE-PRIVACY media-voting variant.
+--
+-- Covers:
+--   (a) happy path -- Issuer+Voter create a VC; the Verifier verifies it and
+--       emits a minimal-disclosure attestation; the reporter tallies it; the
+--       counters update exactly like the Solidity contract. Crucially, we assert
+--       that the ReporterAgency's ledger view NEVER contains the
+--       VerifiableCredential (or any VC field) -- only the VoteAttestation.
+--   (b) non-local voter -- a VC whose city/district do not match the event's
+--       required city/district yields isLocalVoter = False (a soft flag, not an
+--       error): the vote still counts globally but not locally.
+--   (c) double-vote rejection -- a second VerifyAndAttest carrying the same
+--       voterHash on the same target is rejected by the ledger, because it
+--       collides with the persistent VoteNullifier contract key.
+
+module Test where
+
+import Daml.Script
+import DA.Assert ((===))
+import DA.List (head)
+import MediaVoting
+
+-- Common fixture: allocate the four privacy roles + two voters.
+data Fixture = Fixture
+  with
+    issuer : Party
+    verifier : Party
+    reporter : Party
+    alice : Party
+    bob : Party
+
+setup : Script Fixture
+setup = do
+  issuer <- allocateParty "Issuer"
+  verifier <- allocateParty "Verifier"
+  reporter <- allocateParty "ReporterAgency"
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  pure Fixture with ..
+
+-- | Happy path: verification, minimal-disclosure attestation, correct tallies,
+-- and the agency-cannot-see-the-VC privacy assertion.
+happyPath : Script ()
+happyPath = script do
+  Fixture{..} <- setup
+
+  -- Reporter/agency files the event and a media item. No `community` observer:
+  -- individual votes are never visible here, only aggregate tallies.
+  eventCid <- submit reporter do
+    createCmd NewsEvent with
+      reporter
+      eventId = 0
+      name = "Flood in Riverside"
+      description = "Heavy flooding downtown"
+      location = "Riverside"
+      timestamp = 1700000000
+      reporterName = "Jane Doe"
+      reporterOrg = "IMV News"
+      yesCount = 0
+      noCount = 0
+      localYesCount = 0
+      localNoCount = 0
+
+  mediaCid0 <- submit reporter do
+    exerciseCmd eventCid AddMediaItem with
+      mediaId = 0
+      uri = "ipfs://photo1"
+      description = "Street underwater"
+      mediaType = "image"
+
+  -- Issuer + Voter jointly issue Alice's VC. Verifier is an observer; the
+  -- reporter is NOT a stakeholder and so never receives this contract.
+  vcAlice <- submitMulti [issuer, alice] [] do
+    createCmd VerifiableCredential with
+      issuer
+      voter = alice
+      verifier
+      subjectAddress = "0xALICE"
+      city = "Riverside"           -- matches the event's required city -> local
+      district = "Downtown"
+      metadata = "dob=1990"
+      voterHash = "vc-hash-alice"
+
+  -- PRIVACY ASSERTION 1: the agency cannot see the raw VC at all.
+  agencyVCsBefore <- query @VerifiableCredential reporter
+  agencyVCsBefore === []
+  -- Sanity: the verifier (a stakeholder) CAN see it.
+  verifierVCs <- query @VerifiableCredential verifier
+  length verifierVCs === 1
+
+  -- Verifier runs the rule checks and emits the minimal attestation for a
+  -- media-level YES vote by Alice. reqCity/reqDistrict match -> isLocalVoter.
+  attCid <- submit verifier do
+    exerciseCmd vcAlice VerifyAndAttest with
+      reporterAgency = reporter
+      eventId = 0
+      mediaId = Some 0
+      reqCity = "Riverside"
+      reqDistrict = "Downtown"
+      votingParty = alice
+      support = True
+
+  -- PRIVACY ASSERTION 2: the agency now sees the attestation -- and ONLY the
+  -- attestation, still not the VC. The attestation carries a pseudonymous
+  -- voterHash and the outcome, but no Party / city / district.
+  agencyVCsAfter <- query @VerifiableCredential reporter
+  agencyVCsAfter === []
+  agencyAtts <- query @VoteAttestation reporter
+  length agencyAtts === 1
+  let (_, att) = head agencyAtts
+  att.support === True
+  att.isLocalVoter === True
+  att.voterHash === "vc-hash-alice"
+
+  -- Reporter tallies the attestation. YES + local -> yes +1, localYes +1.
+  mediaCid1 <- submit reporter do
+    exerciseCmd mediaCid0 TallyMediaVote with attestationCid = attCid
+
+  Some m1 <- queryContractId reporter mediaCid1
+  m1.yesCount === 1
+  m1.noCount === 0
+  m1.localYesCount === 1
+  m1.localNoCount === 0
+
+  -- Bob votes NO on the same media, and is NOT local (different district).
+  vcBob <- submitMulti [issuer, bob] [] do
+    createCmd VerifiableCredential with
+      issuer
+      voter = bob
+      verifier
+      subjectAddress = "0xBOB"
+      city = "Riverside"
+      district = "Uptown"          -- district mismatch -> not local
+      metadata = "dob=1985"
+      voterHash = "vc-hash-bob"
+
+  attBob <- submit verifier do
+    exerciseCmd vcBob VerifyAndAttest with
+      reporterAgency = reporter
+      eventId = 0
+      mediaId = Some 0
+      reqCity = "Riverside"
+      reqDistrict = "Downtown"
+      votingParty = bob
+      support = False
+
+  mediaCid2 <- submit reporter do
+    exerciseCmd mediaCid1 TallyMediaVote with attestationCid = attBob
+
+  Some m2 <- queryContractId reporter mediaCid2
+  m2.yesCount === 1
+  m2.noCount === 1
+  m2.localYesCount === 1
+  m2.localNoCount === 0
+
+  -- Event-level vote: Alice YES + local (fresh voterHash for the event target).
+  vcAliceEv <- submitMulti [issuer, alice] [] do
+    createCmd VerifiableCredential with
+      issuer
+      voter = alice
+      verifier
+      subjectAddress = "0xALICE"
+      city = "Riverside"
+      district = "Downtown"
+      metadata = "dob=1990"
+      voterHash = "vc-hash-alice-event"
+
+  attEv <- submit verifier do
+    exerciseCmd vcAliceEv VerifyAndAttest with
+      reporterAgency = reporter
+      eventId = 0
+      mediaId = None
+      reqCity = "Riverside"
+      reqDistrict = "Downtown"
+      votingParty = alice
+      support = True
+
+  eventCid1 <- submit reporter do
+    exerciseCmd eventCid TallyEventVote with attestationCid = attEv
+
+  Some e1 <- queryContractId reporter eventCid1
+  e1.yesCount === 1
+  e1.noCount === 0
+  e1.localYesCount === 1
+  e1.localNoCount === 0
+
+  pure ()
+
+-- | A VC whose city does not match the event's required city results in
+-- isLocalVoter = False (a soft flag, not a rejection). The vote still counts
+-- globally.
+nonLocalVoter : Script ()
+nonLocalVoter = script do
+  Fixture{..} <- setup
+
+  eventCid <- submit reporter do
+    createCmd NewsEvent with
+      reporter
+      eventId = 0
+      name = "Protest march"
+      description = "Downtown protest"
+      location = "Capital"
+      timestamp = 1700000000
+      reporterName = "John Roe"
+      reporterOrg = "IMV News"
+      yesCount = 0
+      noCount = 0
+      localYesCount = 0
+      localNoCount = 0
+
+  -- Alice's VC city = "Elsewhere", but the event requires "Capital".
+  vcAlice <- submitMulti [issuer, alice] [] do
+    createCmd VerifiableCredential with
+      issuer
+      voter = alice
+      verifier
+      subjectAddress = "0xALICE"
+      city = "Elsewhere"
+      district = "Somewhere"
+      metadata = "dob=1990"
+      voterHash = "vc-hash-alice"
+
+  attCid <- submit verifier do
+    exerciseCmd vcAlice VerifyAndAttest with
+      reporterAgency = reporter
+      eventId = 0
+      mediaId = None
+      reqCity = "Capital"          -- mismatch with vc.city -> not local
+      reqDistrict = "Center"
+      votingParty = alice
+      support = True
+
+  -- Attestation records the soft result: supported but NOT local.
+  Some att <- queryContractId reporter attCid
+  att.support === True
+  att.isLocalVoter === False
+
+  eventCid1 <- submit reporter do
+    exerciseCmd eventCid TallyEventVote with attestationCid = attCid
+
+  Some e1 <- queryContractId reporter eventCid1
+  e1.yesCount === 1               -- counted globally
+  e1.noCount === 0
+  e1.localYesCount === 0          -- but NOT locally
+  e1.localNoCount === 0
+
+  pure ()
+
+-- | A second VerifyAndAttest with the SAME voterHash on the SAME target is
+-- rejected by the ledger (colliding VoteNullifier key) -- the DAML equivalent of
+-- Solidity `require(!hasVoted[...])` and of a ZK nullifier check.
+doubleVoteRejected : Script ()
+doubleVoteRejected = script do
+  Fixture{..} <- setup
+
+  _ <- submit reporter do
+    createCmd NewsEvent with
+      reporter
+      eventId = 0
+      name = "Protest march"
+      description = "Downtown protest"
+      location = "Capital"
+      timestamp = 1700000000
+      reporterName = "John Roe"
+      reporterOrg = "IMV News"
+      yesCount = 0
+      noCount = 0
+      localYesCount = 0
+      localNoCount = 0
+
+  vcAlice <- submitMulti [issuer, alice] [] do
+    createCmd VerifiableCredential with
+      issuer
+      voter = alice
+      verifier
+      subjectAddress = "0xALICE"
+      city = "Capital"
+      district = "Center"
+      metadata = "dob=1990"
+      voterHash = "dup-hash"
+
+  -- First attestation succeeds and writes the nullifier.
+  _ <- submit verifier do
+    exerciseCmd vcAlice VerifyAndAttest with
+      reporterAgency = reporter
+      eventId = 0
+      mediaId = None
+      reqCity = "Capital"
+      reqDistrict = "Center"
+      votingParty = alice
+      support = True
+
+  -- Second attestation with the SAME voterHash on the SAME target -> colliding
+  -- VoteNullifier key -> ledger rejects the whole transaction.
+  submitMustFail verifier do
+    exerciseCmd vcAlice VerifyAndAttest with
+      reporterAgency = reporter
+      eventId = 0
+      mediaId = None
+      reqCity = "Capital"
+      reqDistrict = "Center"
+      votingParty = alice
+      support = False
+
+  pure ()
+
+-- | The pkEq check: a VC cannot be used to vote as a different Party. The
+-- verifier attesting `votingParty = bob` against Alice's VC must fail.
+subjectMismatchRejected : Script ()
+subjectMismatchRejected = script do
+  Fixture{..} <- setup
+
+  _ <- submit reporter do
+    createCmd NewsEvent with
+      reporter
+      eventId = 0
+      name = "Election night"
+      description = "Local election coverage"
+      location = "Capital"
+      timestamp = 1700000000
+      reporterName = "Jane Doe"
+      reporterOrg = "IMV News"
+      yesCount = 0
+      noCount = 0
+      localYesCount = 0
+      localNoCount = 0
+
+  vcAlice <- submitMulti [issuer, alice] [] do
+    createCmd VerifiableCredential with
+      issuer
+      voter = alice
+      verifier
+      subjectAddress = "0xALICE"
+      city = "Capital"
+      district = "Center"
+      metadata = "dob=1990"
+      voterHash = "vc-hash-alice"
+
+  -- votingParty = bob does not match the VC subject (alice) -> pkEq assert fails.
+  submitMustFail verifier do
+    exerciseCmd vcAlice VerifyAndAttest with
+      reporterAgency = reporter
+      eventId = 0
+      mediaId = None
+      reqCity = "Capital"
+      reqDistrict = "Center"
+      votingParty = bob
+      support = True
+
+  pure ()

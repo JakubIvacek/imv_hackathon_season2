@@ -1,0 +1,326 @@
+-- | Media / news-event credibility voting -- CANTON-NATIVE-PRIVACY VARIANT.
+--
+-- ============================================================================
+--  VARIANT 3 of 3. Privacy WITHOUT cryptography.
+-- ============================================================================
+--  This is the sibling of two other DAML variants of the same Solidity
+--  contract (`media-voting-smart-contract/src/MediaVoting.sol`):
+--
+--    1. no-zk baseline  -- ../no-zk/  : every vote (voter Party, voterHash,
+--       support, isLocalVoter) is a ledger contract visible in cleartext to the
+--       reporter AND the whole community. No privacy at all.
+--    2. zk-SNARK variant (separate future task): eligibility + locality proven
+--       with Circom/snarkjs zero-knowledge proofs; the VC contents never touch
+--       the ledger and NO party is trusted to see them.
+--    3. THIS variant -- Canton-native privacy.
+--
+--  HOW PRIVACY WORKS HERE (the tradeoff to highlight to judges):
+--
+--    Privacy comes from **Canton's native sub-transaction privacy** -- the
+--    signatory/observer model decides *who can see a contract at all* -- plus a
+--    trusted `Verifier` party that checks the eligibility/locality rules **in the
+--    clear**. It is NOT cryptographic:
+--
+--      * The raw Verifiable Credential (city, district, subject address) lives on
+--        a `VerifiableCredential` contract whose only stakeholders are the
+--        `Issuer`, the `Voter`, and the `Verifier`. On a real Canton network no
+--        other participant node -- crucially NOT the reporter/agency -- ever
+--        receives or stores that contract. That is the "private multi-party
+--        sub-transaction": three parties share a fact, the rest of the ledger
+--        never sees it. (On Ethereum every one of those fields would be public.)
+--      * The `Verifier` reads the VC, runs the business-rule checks that the
+--        Circom circuits used to prove in zero knowledge, and emits a narrow
+--        `VoteAttestation` carrying ONLY `support`, `isLocalVoter` and a
+--        pseudonymous `voterHash` -- never the voter's Party, city or district.
+--        That is the data-minimisation payoff: the agency's ledger view never
+--        contains the VC.
+--
+--    Tradeoff vs zk-SNARKs: this is far simpler (no trusted setup, no circuits,
+--    no proving/verifying keys) but it requires **trusting the Verifier party**
+--    at check time. A zk-SNARK needs no trusted party when the proof is verified;
+--    Canton privacy instead relies on the Verifier node being honest and on
+--    Canton's guarantee that non-stakeholders never receive the VC.
+--
+--  WHERE THE CIRCUIT CONSTRAINTS LIVE (see README for the full table): every
+--  constraint from IdentityCircuit.circom / LocationCircuit.circom is
+--  re-expressed as an ordinary DAML `assert` / type / key check inside
+--  `VerifyAndAttest` below, each tagged with a `-- [circuit: ...]` comment.
+-- ============================================================================
+
+module MediaVoting where
+
+import DA.Optional (isSome)
+
+-- ---------------------------------------------------------------------------
+-- Verifiable Credential  (replaces the signed VC the circuits consume)
+-- ---------------------------------------------------------------------------
+
+-- | The voter's Verifiable Credential. Mirrors the circuits' VC fields
+-- (`vc_address`, `vc_city`, `vc_district`, `vc_metadata`).
+--
+-- Stakeholders: `issuer` + `voter` are signatories, `verifier` is an observer.
+-- On Canton this means ONLY these three parties' participant nodes ever receive
+-- this contract -- the reporter/agency and the community never see it. This is
+-- the native-privacy substitution for "the user shares the VC only with a
+-- trusted Issuer and Verifier node".
+--
+-- [circuit: EdDSAPoseidonVerifier / authSigVerify] -- the circuits prove that a
+-- trusted Authority (`pk_auth`) EdDSA-signed the VC. Here the authenticity
+-- guarantee is structural, not cryptographic: `issuer` is a **signatory**, so
+-- this contract cannot exist on the ledger unless the real Issuer party
+-- authored it. "Prove a signature over the VC" becomes "have the actual signer
+-- be a ledger party who co-signs the contract". No Poseidon hash, no EdDSA.
+template VerifiableCredential
+  with
+    issuer : Party          -- trusted VC-issuing authority (circuits' `pk_auth`)
+    voter : Party           -- credential subject (circuits' `vc_address` as a Party)
+    verifier : Party         -- trusted node allowed to read the VC and check rules
+    subjectAddress : Text    -- circuits' `vc_address` as presented on-chain / off-chain id
+    city : Text              -- circuits' `vc_city`
+    district : Text          -- circuits' `vc_district`
+    metadata : Text          -- circuits' `vc_metadata`
+    voterHash : Text         -- circuits' `H_VC` -- pseudonymous nullifier / de-dup id
+  where
+    signatory issuer, voter
+    observer verifier
+
+    -- | Verify the VC against a specific vote and emit a minimal-disclosure
+    -- attestation. Controlled by the trusted `Verifier`. NONCONSUMING: one
+    -- long-lived credential can back votes on many events / media items.
+    --
+    -- Every check below replaces a specific Circom constraint (tagged inline).
+    nonconsuming choice VerifyAndAttest : ContractId VoteAttestation
+      with
+        reporterAgency : Party   -- tally-holding party; must NOT see the VC
+        eventId : Int
+        mediaId : Optional Int   -- None = event-level vote, Some i = media-level
+        reqCity : Text           -- LocationCircuit `req_city`
+        reqDistrict : Text       -- LocationCircuit `req_district`
+        votingParty : Party      -- the Party on-chain claiming to cast this vote
+        support : Bool           -- the vote value
+      controller verifier
+      do
+        -- [circuit: pkEq -- `address === vc_address`] (both circuits)
+        -- The Party claiming to vote must be exactly the VC's subject.
+        assertMsg
+          "VC subject does not match the voting party (pkEq)"
+          (votingParty == voter)
+
+        -- [circuit: voteBool -- `isBoolean(vote)`] (LocationCircuit)
+        -- Constructively unnecessary in DAML: `support : Bool` cannot hold any
+        -- value other than True/False, so the circuit's `vote*(vote-1)===0`
+        -- constraint is enforced by the type system. Asserted here only to make
+        -- the 1:1 mapping explicit for readers.
+        assertMsg
+          "vote must be boolean (guaranteed by the Bool type)"
+          (support == True || support == False)
+
+        -- [circuit: cityEq + districtEq -- `vc_city===req_city`,
+        --  `vc_district===req_district`] (LocationCircuit, sets isLocalVoter)
+        -- Soft check: a mismatch is NOT an error, it just means the voter is not
+        -- local (isLocalVoter = False), matching the Solidity `isLocalVoter`
+        -- flag semantics. The vote still counts globally.
+        let isLocalVoter = (city == reqCity) && (district == reqDistrict)
+
+        -- [circuit: nullifier / H_VC de-dup  +  Solidity `mapping(bytes32=>bool)
+        --  hasVoted`] -- persist a nullifier keyed on the (agency, event, media,
+        -- voterHash) tuple. A second VerifyAndAttest for the same voterHash on
+        -- the same target collides on this contract key and the ledger rejects
+        -- the whole transaction -- exactly `require(!hasVoted[voterHash])`, and
+        -- exactly what a ZK nullifier prevents (double voting under one VC).
+        create VoteNullifier with
+          verifier
+          reporterAgency
+          eventId
+          mediaId
+          voterHash
+
+        -- Minimal-disclosure attestation: the ONLY thing the agency ever sees.
+        create VoteAttestation with
+          verifier
+          reporterAgency
+          eventId
+          mediaId
+          support
+          isLocalVoter
+          voterHash
+
+-- ---------------------------------------------------------------------------
+-- Nullifier  (persistent de-dup record; replaces the Solidity hasVoted mapping
+--             and the ZK nullifier)
+-- ---------------------------------------------------------------------------
+
+-- | Persistent proof that `voterHash` has already voted on this target. Signed
+-- only by the `verifier`, so its key namespace is shared across all voter
+-- identities (like the no-zk variant keying on the reporter). It carries NO
+-- vote content -- just the pseudonymous voterHash -- so it leaks nothing even to
+-- the verifier beyond "this hash was used".
+template VoteNullifier
+  with
+    verifier : Party
+    reporterAgency : Party
+    eventId : Int
+    mediaId : Optional Int
+    voterHash : Text
+  where
+    signatory verifier
+
+    -- Colliding key => ledger rejects the second attestation (the de-dup).
+    key (verifier, reporterAgency, eventId, mediaId, voterHash)
+        : (Party, Party, Int, Optional Int, Text)
+    maintainer key._1
+
+-- ---------------------------------------------------------------------------
+-- Vote Attestation  (minimal-disclosure output handed to the agency)
+-- ---------------------------------------------------------------------------
+
+-- | The narrow, minimal-disclosure result of verification. Signed by the
+-- `verifier`, observed by the `reporterAgency`. Contains ONLY the outcome
+-- (`support`, `isLocalVoter`) and the pseudonymous `voterHash` -- explicitly NOT
+-- the voter's real Party, subject address, city, district or any VC field. This
+-- is what replaces "the reporter learns the vote" without "the reporter learns
+-- the voter".
+template VoteAttestation
+  with
+    verifier : Party
+    reporterAgency : Party
+    eventId : Int
+    mediaId : Optional Int   -- None = event-level, Some i = media item i
+    support : Bool
+    isLocalVoter : Bool
+    voterHash : Text         -- pseudonymous only
+  where
+    signatory verifier
+    observer reporterAgency
+
+    -- | Consume the attestation and hand its outcome to the agency's tally
+    -- choice. Consuming, so a single attestation can be tallied at most once
+    -- (prevents double counting); de-dup across votes is handled by the
+    -- persistent VoteNullifier above.
+    choice RedeemForTally : VoteOutcome
+      controller reporterAgency
+      do pure VoteOutcome with support; isLocalVoter; voterHash; eventId; mediaId
+
+-- | Plain record returned by RedeemForTally.
+data VoteOutcome = VoteOutcome
+  with
+    support : Bool
+    isLocalVoter : Bool
+    voterHash : Text
+    eventId : Int
+    mediaId : Optional Int
+  deriving (Eq, Show)
+
+-- ---------------------------------------------------------------------------
+-- NewsEvent / MediaItem  (structure/naming mirrors the no-zk sibling)
+-- ---------------------------------------------------------------------------
+
+-- | A news event, signed by the reporter/agency that filed it. Unlike the no-zk
+-- variant there is no `community` observer list: individual votes are never
+-- ledger contracts the community could read -- only aggregate tallies live here.
+template NewsEvent
+  with
+    reporter : Party             -- Solidity `reporter`; also the tally-holding agency
+    eventId : Int                -- Solidity `id`
+    name : Text
+    description : Text
+    location : Text
+    timestamp : Int              -- Solidity `uint64 timestamp`
+    reporterName : Text
+    reporterOrg : Text
+    -- Event-level tallies (Solidity yesCount / noCount / localYesCount / localNoCount).
+    yesCount : Int
+    noCount : Int
+    localYesCount : Int
+    localNoCount : Int
+  where
+    signatory reporter
+
+    key (reporter, eventId) : (Party, Int)
+    maintainer key._1
+
+    -- Solidity `addMediaItem`. Nonconsuming: adding media does not disturb the
+    -- event contract or its tallies.
+    nonconsuming choice AddMediaItem : ContractId MediaItem
+      with
+        mediaId : Int
+        uri : Text
+        description : Text
+        mediaType : Text
+      controller reporter
+      do
+        create MediaItem with
+          reporter
+          eventId
+          mediaId
+          uri
+          description
+          mediaType
+          yesCount = 0
+          noCount = 0
+          localYesCount = 0
+          localNoCount = 0
+
+    -- Solidity `voteOnEvent`, privacy-preserving path. The reporter never sees
+    -- who voted: it only consumes a Verifier-issued VoteAttestation and applies
+    -- the same increment logic as the Solidity contract.
+    choice TallyEventVote : ContractId NewsEvent
+      with
+        attestationCid : ContractId VoteAttestation
+      controller reporter
+      do
+        VoteOutcome{..} <- exercise attestationCid RedeemForTally
+        -- The attestation must be for THIS event, at event level.
+        assertMsg "attestation is for a different event" (eventId == this.eventId)
+        assertMsg "attestation is a media-level vote, not event-level" (mediaId == None)
+        -- Same increment logic as the Solidity contract.
+        create this with
+          yesCount      = if support then yesCount + 1 else yesCount
+          noCount       = if support then noCount else noCount + 1
+          localYesCount = if support && isLocalVoter then localYesCount + 1 else localYesCount
+          localNoCount  = if not support && isLocalVoter then localNoCount + 1 else localNoCount
+
+-- | One media item belonging to a news event. Links to its event by the natural
+-- key `(reporter, eventId)`, same as the no-zk variant.
+template MediaItem
+  with
+    reporter : Party
+    eventId : Int
+    mediaId : Int                -- Solidity `id`
+    uri : Text
+    description : Text
+    mediaType : Text
+    yesCount : Int
+    noCount : Int
+    localYesCount : Int
+    localNoCount : Int
+  where
+    signatory reporter
+
+    key (reporter, eventId, mediaId) : (Party, Int, Int)
+    maintainer key._1
+
+    -- Solidity `voteOnMedia` (the no-ZK `_vote` path), privacy-preserving.
+    choice TallyMediaVote : ContractId MediaItem
+      with
+        attestationCid : ContractId VoteAttestation
+      controller reporter
+      do
+        VoteOutcome{..} <- exercise attestationCid RedeemForTally
+        assertMsg "attestation is for a different event" (eventId == this.eventId)
+        assertMsg "attestation is for a different media item"
+          (mediaId == Some this.mediaId)
+        create this with
+          yesCount      = if support then yesCount + 1 else yesCount
+          noCount       = if support then noCount else noCount + 1
+          localYesCount = if support && isLocalVoter then localYesCount + 1 else localYesCount
+          localNoCount  = if not support && isLocalVoter then localNoCount + 1 else localNoCount
+
+-- | Convenience: has this voterHash already voted on this target? Mirrors the
+-- Solidity `hasVotedOnEvent` / `hasVotedOnMedia` views, as a key lookup on the
+-- nullifier. (Kept as a top-level helper so tests / tooling can reuse it.)
+nullifierExists : VoteNullifier -> Update Bool
+nullifierExists n = do
+  r <- lookupByKey @VoteNullifier
+         (n.verifier, n.reporterAgency, n.eventId, n.mediaId, n.voterHash)
+  pure (isSome r)

@@ -1,3 +1,6 @@
-/README.md
-/canton-privacy
-/zk-snark
+# DAML build artifacts (per-variant)
+.daml/
+*.dar
+
+# Editor/OS cruft
+.DS_Store
