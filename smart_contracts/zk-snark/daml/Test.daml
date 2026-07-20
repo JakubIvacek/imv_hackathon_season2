@@ -1,0 +1,283 @@
+-- | Daml Script tests for the ZK-SNARK media-voting variant.
+--
+-- HOW PROOF VALIDITY IS MOCKED: DAML cannot run snarkjs, so these tests act as
+-- the OFF-ledger verifier service. Exactly as `MockZKVoteVerifier.sol` returns a
+-- settable `(voteValid, isLocalVoter)` instead of doing real pairing math, the
+-- test supplies `proofVerified`/`isLocalVoter` to the `AttestProof` choice
+-- directly. A "valid proof" is `AttestProof with proofVerified = True`; an
+-- "invalid proof" is `proofVerified = False` (which the choice rejects), so the
+-- test only creates attestations for proofs it "decided" were valid.
+--
+-- Covers:
+--   (a) happy path -- Voter submits a proof; the (mocked) verifier attests it
+--       valid; the reporter tallies it; counters update exactly like the
+--       Solidity contract, on BOTH a media-level and an event-level vote. Also
+--       asserts the agency's ledger view never contains the ZKProofSubmission --
+--       only the ZKVoteAttestation.
+--   (b) invalid-proof rejection -- AttestProof exercised with proofVerified =
+--       False fails (mirroring Solidity `require(voteProofValid, ...)`), and we
+--       assert NO attestation and NO nullifier were written.
+--   (c) double-vote rejection -- a second AttestProof carrying the same voterHash
+--       on the same target collides with the persistent ZKNullifier key and the
+--       ledger rejects it.
+
+module Test where
+
+import Daml.Script
+import DA.Assert ((===))
+import DA.List (head)
+import MediaVoting
+
+-- Common fixture: allocate the roles + two voters.
+data Fixture = Fixture
+  with
+    verifier : Party
+    reporter : Party
+    alice : Party
+    bob : Party
+
+setup : Script Fixture
+setup = do
+  verifier <- allocateParty "Verifier"
+  reporter <- allocateParty "ReporterAgency"
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  pure Fixture with ..
+
+-- | Build the circuits' public signals for a vote. In production these come out
+-- of `snarkjs`'s public-signals JSON; here we just fill them in.
+mkSignals : Bool -> Text -> Text -> Text -> Text -> PublicSignals
+mkSignals vote subject reqCity reqDistrict hVC =
+  PublicSignals with
+    pkAuth = "0xAUTHORITY_PK"
+    subject
+    vote
+    reqCity
+    reqDistrict
+    hVC
+
+-- | Happy path: proof submission, mocked-valid attestation, correct tallies,
+-- plus the agency-cannot-see-the-proof privacy assertion.
+happyPath : Script ()
+happyPath = script do
+  Fixture{..} <- setup
+
+  -- Reporter/agency files the event and a media item.
+  eventCid <- submit reporter do
+    createCmd NewsEvent with
+      reporter
+      eventId = 0
+      name = "Flood in Riverside"
+      description = "Heavy flooding downtown"
+      location = "Riverside"
+      timestamp = 1700000000
+      reporterName = "Jane Doe"
+      reporterOrg = "IMV News"
+      yesCount = 0
+      noCount = 0
+      localYesCount = 0
+      localNoCount = 0
+
+  mediaCid0 <- submit reporter do
+    exerciseCmd eventCid AddMediaItem with
+      mediaId = 0
+      uri = "ipfs://photo1"
+      description = "Street underwater"
+      mediaType = "image"
+
+  -- Alice generates a proof off-ledger and submits it. Signatory alice,
+  -- observer verifier; the reporter is NOT a stakeholder.
+  subAlice <- submit alice do
+    createCmd ZKProofSubmission with
+      voter = alice
+      verifier
+      reporterAgency = reporter
+      eventId = 0
+      mediaId = Some 0
+      voterHash = "vc-hash-alice"
+      proofBytes = "groth16:proof-alice-media"
+      publicSignals = mkSignals True "0xALICE" "Riverside" "Downtown" "H_VC_alice"
+
+  -- PRIVACY ASSERTION 1: the agency cannot see the raw proof submission at all.
+  agencyProofsBefore <- query @ZKProofSubmission reporter
+  agencyProofsBefore === []
+  -- Sanity: the verifier (an observer) CAN see it, to pick it up off-ledger.
+  verifierProofs <- query @ZKProofSubmission verifier
+  length verifierProofs === 1
+
+  -- The verifier ran `snarkjs groth16 verify` OFF-ledger -> True, and reports
+  -- the proof local. It attests on-ledger (media-level YES vote).
+  attCid <- submit verifier do
+    exerciseCmd subAlice AttestProof with
+      proofVerified = True     -- mocked snarkjs result (see module header)
+      isLocalVoter = True
+
+  -- PRIVACY ASSERTION 2: the agency now sees the attestation -- and ONLY the
+  -- attestation, still not the proof. Carries a pseudonymous voterHash and the
+  -- outcome, but no Party / proof / public signals.
+  agencyProofsAfter <- query @ZKProofSubmission reporter
+  agencyProofsAfter === []
+  agencyAtts <- query @ZKVoteAttestation reporter
+  length agencyAtts === 1
+  let (_, att) = head agencyAtts
+  att.support === True
+  att.isLocalVoter === True
+  att.voterHash === "vc-hash-alice"
+
+  -- Reporter tallies the attestation. YES + local -> yes +1, localYes +1.
+  mediaCid1 <- submit reporter do
+    exerciseCmd mediaCid0 TallyMediaVote with attestationCid = attCid
+
+  Some m1 <- queryContractId reporter mediaCid1
+  m1.yesCount === 1
+  m1.noCount === 0
+  m1.localYesCount === 1
+  m1.localNoCount === 0
+
+  -- Bob votes NO on the same media, and is NOT local.
+  subBob <- submit bob do
+    createCmd ZKProofSubmission with
+      voter = bob
+      verifier
+      reporterAgency = reporter
+      eventId = 0
+      mediaId = Some 0
+      voterHash = "vc-hash-bob"
+      proofBytes = "groth16:proof-bob-media"
+      publicSignals = mkSignals False "0xBOB" "Riverside" "Downtown" "H_VC_bob"
+
+  attBob <- submit verifier do
+    exerciseCmd subBob AttestProof with
+      proofVerified = True
+      isLocalVoter = False     -- proof did not satisfy the locality circuit
+
+  mediaCid2 <- submit reporter do
+    exerciseCmd mediaCid1 TallyMediaVote with attestationCid = attBob
+
+  Some m2 <- queryContractId reporter mediaCid2
+  m2.yesCount === 1
+  m2.noCount === 1
+  m2.localYesCount === 1
+  m2.localNoCount === 0
+
+  -- Event-level vote: Alice YES + local (fresh voterHash for the event target).
+  subAliceEv <- submit alice do
+    createCmd ZKProofSubmission with
+      voter = alice
+      verifier
+      reporterAgency = reporter
+      eventId = 0
+      mediaId = None
+      voterHash = "vc-hash-alice-event"
+      proofBytes = "groth16:proof-alice-event"
+      publicSignals = mkSignals True "0xALICE" "Riverside" "Downtown" "H_VC_alice"
+
+  attEv <- submit verifier do
+    exerciseCmd subAliceEv AttestProof with
+      proofVerified = True
+      isLocalVoter = True
+
+  eventCid1 <- submit reporter do
+    exerciseCmd eventCid TallyEventVote with attestationCid = attEv
+
+  Some e1 <- queryContractId reporter eventCid1
+  e1.yesCount === 1
+  e1.noCount === 0
+  e1.localYesCount === 1
+  e1.localNoCount === 0
+
+  pure ()
+
+-- | Invalid-proof path: the off-ledger snarkjs check returned FALSE, so the
+-- verifier exercising AttestProof with proofVerified = False is rejected by the
+-- choice's `assertMsg` -- mirroring Solidity `require(voteProofValid, "Invalid
+-- vote zk proof")`. We then assert NOTHING was written: no attestation, no
+-- nullifier. (Chosen over "never exercise the choice" because it exercises the
+-- actual rejection branch that a real verifier hits when a bad proof arrives.)
+invalidProofRejected : Script ()
+invalidProofRejected = script do
+  Fixture{..} <- setup
+
+  subAlice <- submit alice do
+    createCmd ZKProofSubmission with
+      voter = alice
+      verifier
+      reporterAgency = reporter
+      eventId = 0
+      mediaId = None
+      voterHash = "vc-hash-alice"
+      proofBytes = "groth16:tampered-proof"
+      publicSignals = mkSignals True "0xALICE" "Riverside" "Downtown" "H_VC_alice"
+
+  -- snarkjs said FALSE -> the choice rejects, whole transaction fails.
+  submitMustFail verifier do
+    exerciseCmd subAlice AttestProof with
+      proofVerified = False
+      isLocalVoter = True
+
+  -- Nothing was written: no attestation and no nullifier exist.
+  atts <- query @ZKVoteAttestation reporter
+  atts === []
+  nulls <- query @ZKNullifier verifier
+  nulls === []
+
+  pure ()
+
+-- | A second AttestProof with the SAME voterHash on the SAME target is rejected
+-- by the ledger (colliding ZKNullifier key) -- the DAML equivalent of Solidity
+-- `require(!hasVoted[...])` and of a ZK nullifier check.
+doubleVoteRejected : Script ()
+doubleVoteRejected = script do
+  Fixture{..} <- setup
+
+  _ <- submit reporter do
+    createCmd NewsEvent with
+      reporter
+      eventId = 0
+      name = "Protest march"
+      description = "Downtown protest"
+      location = "Capital"
+      timestamp = 1700000000
+      reporterName = "John Roe"
+      reporterOrg = "IMV News"
+      yesCount = 0
+      noCount = 0
+      localYesCount = 0
+      localNoCount = 0
+
+  -- First submission + valid attestation writes the nullifier.
+  sub1 <- submit alice do
+    createCmd ZKProofSubmission with
+      voter = alice
+      verifier
+      reporterAgency = reporter
+      eventId = 0
+      mediaId = None
+      voterHash = "dup-hash"
+      proofBytes = "groth16:proof-1"
+      publicSignals = mkSignals True "0xALICE" "Capital" "Center" "H_VC_dup"
+
+  _ <- submit verifier do
+    exerciseCmd sub1 AttestProof with
+      proofVerified = True
+      isLocalVoter = True
+
+  -- A second proof for the SAME voterHash on the SAME target -- even a genuinely
+  -- valid one -- collides with the nullifier key and the ledger rejects it.
+  sub2 <- submit alice do
+    createCmd ZKProofSubmission with
+      voter = alice
+      verifier
+      reporterAgency = reporter
+      eventId = 0
+      mediaId = None
+      voterHash = "dup-hash"
+      proofBytes = "groth16:proof-2"
+      publicSignals = mkSignals False "0xALICE" "Capital" "Center" "H_VC_dup"
+
+  submitMustFail verifier do
+    exerciseCmd sub2 AttestProof with
+      proofVerified = True
+      isLocalVoter = True
+
+  pure ()

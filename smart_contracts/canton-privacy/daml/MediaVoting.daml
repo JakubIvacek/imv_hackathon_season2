@@ -74,7 +74,14 @@ template VerifiableCredential
   with
     issuer : Party          -- trusted VC-issuing authority (circuits' `pk_auth`)
     voter : Party           -- credential subject (circuits' `vc_address` as a Party)
-    verifier : Party         -- trusted node allowed to read the VC and check rules
+    -- This is the zk-SNARK replacement: instead of a Solidity IZKVoteVerifier
+    -- contract checking a zero-knowledge proof's math on-chain, `verifier` is a
+    -- real, trusted Canton party who is simply allowed to SEE this VC in the
+    -- clear (via the `observer verifier` line below) and checks the same rules
+    -- (subject match, city/district match) directly in `VerifyAndAttest`. No
+    -- proof, no circuit -- privacy comes from Canton hiding the VC from every
+    -- other party, not from cryptography. See the module header for the tradeoff.
+    verifier : Party
     subjectAddress : Text    -- circuits' `vc_address` as presented on-chain / off-chain id
     city : Text              -- circuits' `vc_city`
     district : Text          -- circuits' `vc_district`

@@ -18,7 +18,7 @@ as the Solidity source.
 | # | Directory | Privacy mechanism | Status |
 |---|---|---|---|
 | 1 | [`no-zk/`](./no-zk/) | None — deliberate naive baseline | ✅ Built, `daml build` + `daml test` passing |
-| 2 | [`zk-snark/`](./zk-snark/) | Circom/snarkjs zero-knowledge proofs, verified off-ledger with an on-ledger trust attestation | 📝 Plan + design notes only, not implemented |
+| 2 | [`zk-snark/`](./zk-snark/) | Circom/snarkjs zero-knowledge proofs, verified off-ledger with an on-ledger trust attestation | ✅ Built, `daml build` + `daml test` passing (Groth16 check mocked — see below) |
 | 3 | [`canton-privacy/`](./canton-privacy/) | Canton native sub-transaction privacy (signatory/observer scoping) + a trusted `Verifier` party checking rules in the clear | ✅ Built, `daml build` + `daml test` passing |
 
 ### 1. No-ZK baseline (`no-zk/`)
@@ -28,19 +28,24 @@ community observer list. `voterHash` is used only for deduplication via a DAML
 contract key — there is no privacy protection at all. This is the transparent
 contrast point for the other two variants.
 
-### 2. ZK-SNARK variant (`zk-snark/`, design only — not implemented)
+### 2. ZK-SNARK variant (`zk-snark/`, built and passing)
 
-Would reuse the existing Circom circuits at
+Reuses the existing Circom circuits at
 `../ZK-SNARKs/identity-verifier/IdentityCircuit.circom` and
 `../ZK-SNARKs/location-verifier/LocationCircuit.circom`, proved off-ledger.
 **Important caveat, see `zk-snark/README.md` for the full writeup:** Canton/
 DAML has no native elliptic-curve pairing precompile (unlike the EVM), so DAML
-cannot verify the proof itself. The planned design has a trusted `Verifier`
-party run `snarkjs groth16 verify` off-ledger and submit an on-ledger
-attestation — meaningfully weaker than a real on-chain zk-SNARK verifier,
-which needs no trusted party at verification time. This variant is currently
-just a written plan (parties, templates, constraint mapping) so it can be
-picked up later without re-deriving the architecture.
+cannot verify the proof itself. A single trusted `Verifier` party runs
+`snarkjs groth16 verify` off-ledger and submits an on-ledger `ZKVoteAttestation`
+— meaningfully weaker than a real on-chain zk-SNARK verifier, which needs no
+trusted party at verification time (a federated-quorum alternative was
+considered and rejected for this build in favour of simplicity). Implemented
+templates: `ZKProofSubmission`, `ZKVoteAttestation`, `ZKNullifier`, plus
+`NewsEvent`/`MediaItem`. Because this environment has no compiled proving/
+verification keys and DAML cannot run snarkjs, the Groth16 pairing check itself
+is **mocked** in tests (proof validity passed in as a `Bool`, mirroring
+`MockZKVoteVerifier.sol`); the off-ledger service is sketched in
+`zk-snark/verifier-service/verify.md`.
 
 ### 3. Canton-native privacy (`canton-privacy/`)
 
