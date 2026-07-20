@@ -67,3 +67,21 @@ daml test
 See each variant's own `README.md` for its data-model mapping, design
 decisions, and (for `canton-privacy/`) the full circuit-constraint ↔ DAML-check
 table.
+
+## Editor setup (VS Code)
+
+`.daml` files need the Daml language extension for syntax highlighting and
+IDE support — without it they render as plain grey text.
+
+The extension isn't reliably installable by ID from the VS Code Marketplace
+UI/CLI (`DigitalAssetHoldingsLLC.daml`) in some environments. The reliable
+path is to let the Daml SDK install its own bundled copy:
+
+```bash
+daml studio --replace=published
+```
+
+This installs `digitalassetholdingsllc.daml-bundled` (falling back
+automatically if the marketplace lookup fails) and opens VS Code. After it
+runs, reload the window (`Ctrl+Shift+P` → "Reload Window") and reopen any
+`.daml` file.
